@@ -1,0 +1,7 @@
+sync_now:
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: atmo_history

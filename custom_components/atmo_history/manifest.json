@@ -1,0 +1,21 @@
+{
+  "domain": "atmo_history",
+  "name": "Atmotube History",
+  "bluetooth": [
+    {
+      "local_name": "ATMOTUBE",
+      "service_uuid": "db450001-8e9a-4818-add7-6ed94a328ab4",
+      "connectable": true
+    }
+  ],
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["bluetooth_adapters", "recorder"],
+  "documentation": "https://github.com/RICKxxROLLING/Main-Project",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/RICKxxROLLING/Main-Project/issues",
+  "loggers": ["custom_components.atmo_history"],
+  "requirements": [],
+  "version": "0.1.0"
+}

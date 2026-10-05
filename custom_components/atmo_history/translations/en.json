@@ -1,0 +1,88 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "description": "Pick a discovered Atmotube PRO or type its MAC address.",
+        "data": { "address": "Device" }
+      },
+      "bluetooth_confirm": {
+        "description": "Set up history backfill for {name} ({address})?"
+      }
+    },
+    "error": {
+      "invalid_address": "Enter a MAC address like AA:BB:CC:DD:EE:FF."
+    },
+    "abort": {
+      "already_configured": "This device is already configured.",
+      "not_supported": "This is not an original Atmotube PRO."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "absent_minutes": "Absence before a new sync",
+          "sync_delay": "Delay after the device reappears",
+          "retry_minutes": "Retry interval after a failed sync",
+          "record_interval": "Seconds between history records",
+          "confirm_interval": "I have verified the record interval",
+          "dry_run": "Dry run (log records, store nothing, never acknowledge)",
+          "influx_enabled": "Also write raw records to InfluxDB v2",
+          "influx_url": "InfluxDB URL",
+          "influx_token": "InfluxDB token",
+          "influx_org": "InfluxDB organization",
+          "influx_bucket": "InfluxDB bucket"
+        },
+        "data_description": {
+          "absent_minutes": "The device must have been out of range at least this long for its return to start a sync.",
+          "record_interval": "Not documented by Atmotube; 60 s is the community-observed value. It is checked automatically against consecutive history batches.",
+          "confirm_interval": "Tick only after verifying the interval yourself, e.g. when the automatic check was fooled by a recording gap. Batches held for the check are then imported."
+        }
+      }
+    },
+    "error": {
+      "influx_failed": "Could not reach InfluxDB or the bucket was not found."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "last_sync": { "name": "Last history sync" },
+      "records_imported": { "name": "History records imported" },
+      "last_result": {
+        "name": "Last history sync result",
+        "state": {
+          "success": "Success",
+          "no_data": "No new data",
+          "dry_run": "Dry run",
+          "awaiting_interval_check": "Holding data until interval is confirmed",
+          "interval_mismatch": "Record interval mismatch",
+          "device_unavailable": "Device unavailable",
+          "error": "Error"
+        }
+      }
+    }
+  },
+  "issues": {
+    "interval_mismatch": {
+      "title": "Atmotube history record interval mismatch",
+      "description": "History sync for {name} stopped: consecutive history batches imply {measured} s between records, but {configured} s is configured. Nothing was acknowledged, so the device keeps the data.\n\nIf the measured value is right, change \"Seconds between history records\" in the integration options. If the device was switched off between batches (a recording gap), tick \"I have verified the record interval\" instead."
+    }
+  },
+  "exceptions": {
+    "no_entry": { "message": "No loaded Atmotube History entry matches." },
+    "already_syncing": { "message": "A history sync is already running." }
+  },
+  "services": {
+    "sync_now": {
+      "name": "Sync now",
+      "description": "Download stored history from the Atmotube now.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Device",
+          "description": "Only sync this entry. Defaults to all."
+        }
+      }
+    }
+  }
+}

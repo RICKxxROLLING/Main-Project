@@ -1,1 +1,170 @@
-# Main-Project
+# Atmotube History (`atmo_history`)
+
+A Home Assistant custom integration that downloads the measurement history stored on an
+**original Atmotube PRO** (not the PRO 2) over Bluetooth whenever it comes into range, and
+imports it with the original timestamps:
+
+- as **external long-term statistics** (hourly mean/min/max per metric), merged into hours that
+  already have data rather than overwriting them, and
+- optionally as **raw per-record points in InfluxDB v2**.
+
+It only does history backfill. Live readings are left to
+[ha-atmo](https://github.com/natekspencer/ha-atmo) (`atmo`), and this integration creates no live
+sensors. Its diagnostic entities attach to the same device as ha-atmo's, because both identify the
+device by its Bluetooth address.
+
+## Requirements
+
+- Home Assistant 2026.9 or newer.
+- A connectable Bluetooth path to the device. A local adapter works, and so does an
+  **ESPHome Bluetooth proxy with `active: true`**:
+
+  ```yaml
+  bluetooth_proxy:
+    active: true
+  ```
+
+  A passive proxy can see advertisements but cannot connect, so history cannot be downloaded
+  through it. ESPHome proxies have a small number of connection slots (3 by default), shared
+  with every other integration that connects through them.
+
+## Things that will stop you getting data
+
+**The phone app must stop syncing.** The device deletes history from its "unsynced" queue as
+soon as any client acknowledges it. Whichever client acknowledges first (the Atmotube app, or
+this integration) gets that data, and the other never sees it. Turn off background sync in the
+Atmotube app, or keep the phone away from the device, or you will get gaps.
+
+**ha-atmo's "Enable polling" competes for the connection.** If that option is on, ha-atmo
+connects to the device to read extra values. The device takes one connection at a time, so a
+history sync can fail to connect, or be cut off, while ha-atmo is connected. Failed syncs are
+retried (see below) and never lose data, but turning polling off avoids the contention.
+
+## Installation
+
+1. HACS → three dots → *Custom repositories* → add this repository as an **Integration**.
+2. Install *Atmotube History* and restart Home Assistant.
+3. The device is discovered automatically (local name `ATMOTUBE` and service UUID
+   `DB450001-8E9A-4818-ADD7-6ED94A328AB4`). You can also add it under
+   *Settings → Devices & services → Add integration → Atmotube History* and type the MAC address.
+
+## How syncing works
+
+- The integration listens for the device's advertisements. When the device **reappears after
+  being out of range for at least 10 minutes** (configurable), it waits **30 s** and then syncs.
+  The first sighting after Home Assistant starts also counts as a reappearance.
+- If a sync fails, it is **retried every 15 minutes** (configurable) while the device stays in
+  range.
+- `atmo_history.sync_now` runs a sync on demand. It takes an optional `config_entry_id`.
+
+The transfer uses the Nordic UART service (`6E400001-…`). The integration sends `HST` plus the
+current time. The device then sends batches, each an `HT` header followed by `HD` data packets.
+Each **complete** batch is written to the recorder, the commit is awaited, the batch is written
+to InfluxDB if that is enabled, and only then is it acknowledged with `HOK`. A disconnect, a
+timeout, a missing or duplicate packet, or any storage failure means the batch is **not**
+acknowledged, so the device keeps it and sends it again next time. Re-sent data is
+de-duplicated, so hours are never double-counted.
+
+## Protocol details that are not officially documented
+
+Atmotube's [Bluetooth API article](https://support.atmotube.com/en/articles/10364981-bluetooth-api)
+leaves some details out. This is how the integration handles each one:
+
+| Detail | What the integration does | Source |
+|---|---|---|
+| Timestamp byte order (`HST`/`HOK`/`HT`) | Big-endian. Record fields are little-endian. | [atmotuber](https://github.com/AtzeniMichele/atmotuber) `utils.dart`. Atmotube's Android library has no history code. |
+| Interval between records | 60 s by default, **checked automatically** (see below) | atmotuber's comment: "Check csv value: yes every one minute" |
+| Record size | Reads the 14 documented bytes and ignores the rest (atmotuber reports 16) | atmotuber |
+| Records per `HD` packet | Splits each packet by the record size from `HT` | — |
+| Packet numbering | Accepts 1..N (atmotuber) or 0..N-1 | atmotuber |
+| PM value `0xFFFF` | Treated as "PM sensor off" and skipped | Both Atmotube's Android library and atmotuber |
+
+**Interval check.** The interval is never assumed. The gap between two consecutive `HT` headers,
+divided by the number of records in the first batch, gives the real spacing between records.
+Until that has matched the configured interval once:
+
+- downloaded batches are **kept as raw bytes in Home Assistant's storage and acknowledged**, but
+  not imported, and
+- once a match is seen, everything held is imported.
+
+If the measured interval doesn't match, the sync **stops without acknowledging** and a repair
+issue explains what to do. Either set *Seconds between history records* to the measured value,
+or tick *I have verified the record interval* if the difference was a recording gap (the device
+was switched off). Once the interval is confirmed, a larger spacing is logged as a gap, and a
+smaller one stops the sync.
+
+A first-record time before 2016 or in the future aborts the batch without acknowledging it. If
+reading the bytes in the other order would give a sensible time, the error says so.
+
+## Verifying against your own device
+
+1. Turn on debug logging:
+
+   ```yaml
+   logger:
+     logs:
+       custom_components.atmo_history: debug
+   ```
+
+   The raw `HT`/`HD` packets (`RX HT: 4854...`), the commands sent (`TX: 485354...`) and the
+   decoded headers are logged.
+2. For the first sync, enable **Dry run** in the options. It downloads the first batch, logs
+   every decoded record at info level, stores nothing and **never acknowledges**, so the data
+   stays on the device. Compare the values and timestamps with the Atmotube app, then turn dry
+   run off.
+
+## Options
+
+| Option | Default | |
+|---|---|---|
+| Absence before a new sync | 10 min | |
+| Delay after the device reappears | 30 s | |
+| Retry interval after a failed sync | 15 min | |
+| Seconds between history records | 60 | See the interval check above |
+| I have verified the record interval | off | Only acts at the moment you save the form |
+| Dry run | off | |
+| InfluxDB v2 URL / token / org / bucket | — | Tested when saved. A write failure blocks the acknowledgement. |
+
+## What you get
+
+**Statistics** (use them in *Statistics graph* cards, or under *Developer tools → Statistics*):
+
+| Statistic ID | Unit |
+|---|---|
+| `atmo_history:<mac>_temperature` | °C |
+| `atmo_history:<mac>_humidity` | % |
+| `atmo_history:<mac>_voc` | ppb |
+| `atmo_history:<mac>_pressure` | Pa |
+| `atmo_history:<mac>_pm1`, `_pm25`, `_pm10` | µg/m³ |
+
+The units match ha-atmo's live sensors. External statistics have a unit but no device class,
+because Home Assistant does not store one for them.
+
+Merging is exact for the last 30 days. When newer data lands in an hour older than that, the
+existing row is weighted as if it covered the rest of the hour.
+
+**InfluxDB** gets a measurement `atmotube_history`, tagged `device=<MAC>`, with float fields
+`temperature humidity voc pressure pm1 pm25 pm10` at second precision. PM fields are left out
+when the sensor was off.
+
+**Diagnostic sensors:**
+
+- *Last history sync*: the time of the last sync that succeeded.
+- *History records imported*: the number of new records from the last sync. In dry run it shows
+  the number decoded instead. The `held_batches` attribute counts batches waiting for the
+  interval check.
+- *Last history sync result*: one of `success`, `no_data`, `dry_run`, `awaiting_interval_check`,
+  `interval_mismatch`, `device_unavailable` or `error`. The `error` attribute has the details.
+
+## Development
+
+```bash
+pip install -r requirements_test.txt   # Python 3.14
+pytest
+```
+
+`protocol.py` and `aggregate.py` don't import Home Assistant or bleak. They are tested with
+hand-built packet fixtures: multi-packet and multi-batch transfers, empty history, truncated
+transfers, disconnects, inconsistent packets and byte-order detection. The config flow, the
+trigger timing and end-to-end imports into a real in-memory recorder are tested with
+`pytest-homeassistant-custom-component`.

@@ -1,0 +1,480 @@
+"""Sync orchestration: triggers, locking, persistence and import."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from time import monotonic
+from typing import Any
+
+from bleak.exc import BleakError
+from homeassistant.components import bluetooth
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import CALLBACK_TYPE, HassJob, HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
+
+from . import influx
+from .aggregate import (
+    INTERVAL_GAP,
+    INTERVAL_MATCH,
+    HourlyAggregator,
+    classify_interval,
+    measured_interval,
+)
+from .ble import async_download_history
+from .const import (
+    CONF_ABSENT_MINUTES,
+    CONF_DRY_RUN,
+    CONF_INFLUX_BUCKET,
+    CONF_INFLUX_ENABLED,
+    CONF_INFLUX_ORG,
+    CONF_INFLUX_TOKEN,
+    CONF_INFLUX_URL,
+    CONF_RECORD_INTERVAL,
+    CONF_RETRY_MINUTES,
+    CONF_SYNC_DELAY,
+    DEFAULT_ABSENT_MINUTES,
+    DEFAULT_RECORD_INTERVAL,
+    DEFAULT_RETRY_MINUTES,
+    DEFAULT_SYNC_DELAY,
+    DOMAIN,
+    ISSUE_INTERVAL_MISMATCH,
+    RESULT_AWAITING_INTERVAL,
+    RESULT_DRY_RUN,
+    RESULT_ERROR,
+    RESULT_INTERVAL_MISMATCH,
+    RESULT_NO_DATA,
+    RESULT_SUCCESS,
+    RESULT_UNAVAILABLE,
+    SESSION_TIMEOUT,
+    SIGNAL_UPDATED,
+)
+from .protocol import (
+    HistoryBatch,
+    HistoryDataPacket,
+    HistoryHeader,
+    HistoryRecord,
+    ProtocolError,
+    TransferAborted,
+)
+from .statistics import async_import_records
+
+_LOGGER = logging.getLogger(__name__)
+
+STORAGE_VERSION = 1
+
+type AtmoHistoryConfigEntry = ConfigEntry[AtmoHistoryManager]
+
+
+class IntervalMismatch(Exception):
+    """The measured record interval does not match the configured one."""
+
+    def __init__(self, measured: float, configured: int) -> None:
+        """Initialize."""
+        super().__init__(
+            f"Measured record interval {measured:.1f} s does not match the "
+            f"configured {configured} s"
+        )
+        self.measured = measured
+        self.configured = configured
+
+
+@dataclass
+class SyncStatus:
+    """What the diagnostic sensors show."""
+
+    last_success: datetime | None = None
+    last_attempt: datetime | None = None
+    last_records: int | None = None
+    last_result: str | None = None
+    last_error: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        """Serialize."""
+        data = asdict(self)
+        for key in ("last_success", "last_attempt"):
+            if data[key] is not None:
+                data[key] = data[key].isoformat()
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> SyncStatus:
+        """Deserialize."""
+        status = cls(**(data or {}))
+        for key in ("last_success", "last_attempt"):
+            if (value := getattr(status, key)) is not None:
+                setattr(status, key, dt_util.parse_datetime(value))
+        return status
+
+
+def _batch_to_dict(batch: HistoryBatch) -> dict[str, Any]:
+    return {
+        "first_timestamp": batch.header.first_timestamp,
+        "packet_count": batch.header.packet_count,
+        "record_size": batch.header.record_size,
+        "packets": {str(n): p.hex() for n, p in batch.packets.items()},
+    }
+
+
+def _batch_from_dict(data: dict[str, Any]) -> HistoryBatch:
+    batch = HistoryBatch(
+        HistoryHeader(
+            first_timestamp=data["first_timestamp"],
+            packet_count=data["packet_count"],
+            record_size=data["record_size"],
+        )
+    )
+    for number, payload in data["packets"].items():
+        batch.add(HistoryDataPacket(int(number), bytes.fromhex(payload)))
+    return batch
+
+
+class AtmoHistoryManager:
+    """Owns the sync lifecycle for one Atmotube."""
+
+    def __init__(self, hass: HomeAssistant, entry: AtmoHistoryConfigEntry) -> None:
+        """Initialize."""
+        self.hass = hass
+        self.entry = entry
+        self.address: str = entry.unique_id or entry.data["address"]
+        self.name = entry.title
+        self.status = SyncStatus()
+        self._store: Store[dict[str, Any]] = Store(
+            hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}"
+        )
+        self._aggregator = HourlyAggregator()
+        self._confirmed_interval: int | None = None
+        self._last_batch: dict[str, int] | None = None
+        self._pending: list[dict[str, Any]] = []
+        self._lock = asyncio.Lock()
+        self._last_seen: float | None = None
+        self._last_attempt: float | None = None
+        self._failed = False
+        self._blocked = False
+        self._cancel_scheduled: CALLBACK_TYPE | None = None
+        self._session_imported = 0
+        self._session_decoded = 0
+        self._unsubs: list[Callable[[], None]] = []
+
+    # Options -----------------------------------------------------------
+
+    def _opt(self, key: str, default: Any) -> Any:
+        return self.entry.options.get(key, default)
+
+    @property
+    def interval(self) -> int:
+        """Configured record interval in seconds."""
+        return int(self._opt(CONF_RECORD_INTERVAL, DEFAULT_RECORD_INTERVAL))
+
+    @property
+    def interval_confirmed(self) -> bool:
+        """Whether the configured interval has been verified."""
+        return self._confirmed_interval == self.interval
+
+    @property
+    def pending_batches(self) -> int:
+        """Batches downloaded and ACKed but not yet imported."""
+        return len(self._pending)
+
+    @property
+    def syncing(self) -> bool:
+        """Whether a sync is running."""
+        return self._lock.locked()
+
+    # Lifecycle ---------------------------------------------------------
+
+    async def async_load(self) -> None:
+        """Load persisted state."""
+        data = await self._store.async_load() or {}
+        self._aggregator = HourlyAggregator.from_dict(data.get("hours"))
+        self._confirmed_interval = data.get("confirmed_interval")
+        self._last_batch = data.get("last_batch")
+        self._pending = data.get("pending", [])
+        self.status = SyncStatus.from_dict(data.get("status"))
+
+    async def _async_save(self) -> None:
+        await self._store.async_save(
+            {
+                "hours": self._aggregator.as_dict(),
+                "confirmed_interval": self._confirmed_interval,
+                "last_batch": self._last_batch,
+                "pending": self._pending,
+                "status": self.status.as_dict(),
+            }
+        )
+
+    @callback
+    def async_start(self) -> None:
+        """Start listening for the device."""
+        ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
+        self._unsubs.append(
+            bluetooth.async_register_callback(
+                self.hass,
+                self._async_on_advertisement,
+                bluetooth.BluetoothCallbackMatcher(address=self.address),
+                bluetooth.BluetoothScanningMode.PASSIVE,
+                replay=bluetooth.BluetoothCallbackReplay.DISABLED,
+            )
+        )
+        if self._pending and self.interval_confirmed:
+            self.entry.async_create_background_task(
+                self.hass, self._async_import_pending_locked(), "atmo_history_pending"
+            )
+
+    @callback
+    def async_stop(self) -> None:
+        """Stop listening and cancel scheduled work."""
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs.clear()
+        self._cancel_schedule()
+
+    async def async_confirm_interval(self, interval: int) -> None:
+        """Mark ``interval`` as verified by the user."""
+        self._confirmed_interval = interval
+        await self._async_save()
+
+    @property
+    def _issue_id(self) -> str:
+        return f"{ISSUE_INTERVAL_MISMATCH}_{self.entry.entry_id}"
+
+    # Triggering --------------------------------------------------------
+
+    @callback
+    def _async_on_advertisement(
+        self,
+        service_info: bluetooth.BluetoothServiceInfoBleak,
+        change: bluetooth.BluetoothChange,
+    ) -> None:
+        now = monotonic()
+        previous, self._last_seen = self._last_seen, now
+        if self._blocked or self._lock.locked() or self._cancel_scheduled:
+            return
+        absent = float(self._opt(CONF_ABSENT_MINUTES, DEFAULT_ABSENT_MINUTES)) * 60
+        retry = float(self._opt(CONF_RETRY_MINUTES, DEFAULT_RETRY_MINUTES)) * 60
+        if previous is None or now - previous >= absent:
+            delay = float(self._opt(CONF_SYNC_DELAY, DEFAULT_SYNC_DELAY))
+            _LOGGER.debug("%s reappeared, syncing in %s s", self.address, delay)
+            self._schedule(delay, "reappeared")
+        elif self._failed and self._last_attempt is not None and now - self._last_attempt >= retry:
+            _LOGGER.debug("%s still in range after a failed sync, retrying", self.address)
+            self._schedule(0, "retry")
+
+    def _schedule(self, delay: float, reason: str) -> None:
+        @callback
+        def _fire(_now: datetime) -> None:
+            self._cancel_scheduled = None
+            self.entry.async_create_background_task(
+                self.hass, self.async_sync(reason), f"atmo_history_sync_{reason}"
+            )
+
+        self._cancel_scheduled = async_call_later(
+            self.hass, delay, HassJob(_fire, cancel_on_shutdown=True)
+        )
+
+    def _cancel_schedule(self) -> None:
+        if self._cancel_scheduled:
+            self._cancel_scheduled()
+            self._cancel_scheduled = None
+
+    # Sync --------------------------------------------------------------
+
+    async def async_sync(self, reason: str) -> None:
+        """Run one sync session. Never raises; see ``status``."""
+        if self._lock.locked():
+            _LOGGER.debug("Sync already running, ignoring %s request", reason)
+            return
+        async with self._lock:
+            self._cancel_schedule()
+            await self._async_sync_locked(reason)
+
+    async def _async_sync_locked(self, reason: str) -> None:
+        _LOGGER.debug("Starting history sync for %s (%s)", self.address, reason)
+        self._last_attempt = monotonic()
+        self.status.last_attempt = dt_util.utcnow()
+        self._session_imported = 0
+        self._session_decoded = 0
+        dry_run = bool(self._opt(CONF_DRY_RUN, False))
+
+        ble_device = bluetooth.async_ble_device_from_address(
+            self.hass, self.address, connectable=True
+        )
+        if ble_device is None:
+            await self._async_finish(
+                RESULT_UNAVAILABLE,
+                failed=True,
+                error="No connectable Bluetooth adapter or proxy can reach the device",
+            )
+            return
+
+        try:
+            async with asyncio.timeout(SESSION_TIMEOUT):
+                result = await async_download_history(
+                    ble_device, self.name, self._async_handle_batch
+                )
+        except IntervalMismatch as err:
+            self._blocked = True
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                self._issue_id,
+                is_fixable=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key=ISSUE_INTERVAL_MISMATCH,
+                translation_placeholders={
+                    "name": self.name,
+                    "measured": f"{err.measured:.1f}",
+                    "configured": str(err.configured),
+                },
+            )
+            _LOGGER.warning("%s; sync stopped until the interval is resolved", err)
+            await self._async_finish(RESULT_INTERVAL_MISMATCH, failed=False, error=str(err))
+            return
+        except (
+            ProtocolError,
+            TransferAborted,
+            BleakError,
+            TimeoutError,
+            influx.InfluxError,
+            HomeAssistantError,
+        ) as err:
+            message = str(err) or type(err).__name__
+            _LOGGER.warning("History sync for %s failed: %s", self.address, message)
+            await self._async_finish(RESULT_ERROR, failed=True, error=message)
+            return
+        except Exception as err:
+            _LOGGER.exception("Unexpected error during history sync")
+            await self._async_finish(RESULT_ERROR, failed=True, error=repr(err))
+            return
+
+        if dry_run:
+            outcome = RESULT_DRY_RUN
+        elif self._pending:
+            outcome = RESULT_AWAITING_INTERVAL
+        elif result.batches_acked == 0:
+            outcome = RESULT_NO_DATA
+        else:
+            outcome = RESULT_SUCCESS
+        await self._async_finish(outcome, failed=False, error=None)
+
+    async def _async_finish(self, result: str, failed: bool, error: str | None) -> None:
+        self._failed = failed
+        self.status.last_result = result
+        self.status.last_error = error
+        self.status.last_records = (
+            self._session_decoded if result == RESULT_DRY_RUN else self._session_imported
+        )
+        if result in (RESULT_SUCCESS, RESULT_NO_DATA, RESULT_AWAITING_INTERVAL):
+            self.status.last_success = dt_util.utcnow()
+        await self._async_save()
+        async_dispatcher_send(self.hass, SIGNAL_UPDATED.format(self.entry.entry_id))
+
+    async def _async_handle_batch(self, batch: HistoryBatch) -> bool:
+        """Persist a complete batch. Returning True lets the device be ACKed."""
+        header = batch.header
+        interval = self.interval
+
+        if self._opt(CONF_DRY_RUN, False):
+            records = batch.records(interval)
+            self._session_decoded += len(records)
+            _LOGGER.info(
+                "Dry run: batch at %s, %s packets of %s-byte records, %s records "
+                "(not acknowledged, nothing stored)",
+                header.first_timestamp,
+                header.packet_count,
+                header.record_size,
+                len(records),
+            )
+            for record in records:
+                _LOGGER.info("Dry run record: %s", record)
+            return False
+
+        if self._last_batch:
+            measured = measured_interval(
+                self._last_batch["first_timestamp"],
+                self._last_batch["record_count"],
+                header.first_timestamp,
+            )
+            if measured is not None:
+                verdict = classify_interval(measured, interval, self.interval_confirmed)
+                if verdict == INTERVAL_MATCH and not self.interval_confirmed:
+                    _LOGGER.info("Record interval of %s s confirmed", interval)
+                    self._confirmed_interval = interval
+                elif verdict == INTERVAL_GAP:
+                    _LOGGER.info(
+                        "Recording gap before %s (spacing %.1f s)",
+                        header.first_timestamp,
+                        measured,
+                    )
+                elif verdict != INTERVAL_MATCH:
+                    raise IntervalMismatch(measured, interval)
+
+        if self.interval_confirmed:
+            await self._async_import_pending()
+            await self._async_import(batch.records(interval))
+        else:
+            _LOGGER.info(
+                "Holding batch at %s until the record interval is confirmed",
+                header.first_timestamp,
+            )
+            self._pending.append(_batch_to_dict(batch))
+
+        self._last_batch = {
+            "first_timestamp": header.first_timestamp,
+            "record_count": batch.record_count,
+        }
+        await self._async_save()
+        return True
+
+    async def _async_import_pending_locked(self) -> None:
+        async with self._lock:
+            try:
+                await self._async_import_pending()
+            except (influx.InfluxError, HomeAssistantError, ProtocolError) as err:
+                _LOGGER.warning("Importing held batches failed: %s", err)
+                return
+            await self._async_save()
+            async_dispatcher_send(self.hass, SIGNAL_UPDATED.format(self.entry.entry_id))
+
+    async def _async_import_pending(self) -> None:
+        while self._pending:
+            batch = _batch_from_dict(self._pending[0])
+            await self._async_import(batch.records(self.interval))
+            self._pending.pop(0)
+            await self._async_save()
+
+    async def _async_import(self, records: list[HistoryRecord]) -> None:
+        """Write to statistics and InfluxDB; only then keep the new state."""
+        if not records:
+            return
+        aggregator = self._aggregator.copy()
+        added = await async_import_records(
+            self.hass, self.address, self.name, aggregator, records, self.interval
+        )
+        if self._opt(CONF_INFLUX_ENABLED, False):
+            await influx.async_write(
+                async_get_clientsession(self.hass),
+                self._opt(CONF_INFLUX_URL, ""),
+                self._opt(CONF_INFLUX_TOKEN, ""),
+                self._opt(CONF_INFLUX_ORG, ""),
+                self._opt(CONF_INFLUX_BUCKET, ""),
+                influx.to_line_protocol(self.address, records),
+            )
+        self._aggregator = aggregator
+        self._session_imported += added
+        _LOGGER.debug(
+            "Imported %s new of %s records (%s to %s)",
+            added,
+            len(records),
+            records[0].timestamp,
+            records[-1].timestamp,
+        )
